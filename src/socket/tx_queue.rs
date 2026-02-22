@@ -206,3 +206,10 @@ impl TxQueue {
         &mut self.socket.fd
     }
 }
+
+impl TxQueue {
+    /// Update XSKMAP with the underlying socket.
+    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+        self.socket.update_xskmap(map_fd)
+    }
+}

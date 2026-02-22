@@ -308,6 +308,19 @@ impl Umem {
         unsafe { self.mem.data_mut(desc) }
     }
 
+    /// Get a raw pointer to the underlying memory region.
+    /// Used to create a MemoryRegion wrapping the same memory.
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mem.as_ptr() as *mut u8
+    }
+
+    /// Get the total size of the underlying memory region.
+    #[inline]
+    pub fn buffer_len(&self) -> usize {
+        self.mem.len()
+    }
+
     /// Intended to be called on socket creation, this passes the
     /// create function a pointer to the UMEM and any saved fill queue
     /// or completion queue.

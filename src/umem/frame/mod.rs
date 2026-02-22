@@ -25,8 +25,10 @@ use std::{
 /// [`mtu`]: crate::config::UmemConfig::mtu
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SegmentLengths {
-    pub(crate) headroom: usize,
-    pub(crate) data: usize,
+    /// Current length of the headroom segment.
+    pub headroom: usize,
+    /// Current length of the packet data segment.
+    pub data: usize,
 }
 
 impl SegmentLengths {
@@ -71,6 +73,37 @@ impl FrameDesc {
         }
     }
 
+    /// Creates a new frame descriptor with the given address and data length.
+    /// Public API for creating frame descriptors from external crates.
+    pub fn with_data_len(addr: usize, data_len: usize) -> Self {
+        Self {
+            addr,
+            options: 0,
+            lengths: SegmentLengths {
+                headroom: 0,
+                data: data_len,
+            },
+        }
+    }
+
+    /// Get the data segment length.
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.lengths.data
+    }
+
+    /// Set the data segment length.
+    #[inline]
+    pub fn set_data_len(&mut self, len: usize) {
+        self.lengths.data = len;
+    }
+
+    /// Get mutable reference to segment lengths.
+    #[inline]
+    pub fn lengths_mut(&mut self) -> &mut SegmentLengths {
+        &mut self.lengths
+    }
+
     /// The starting address of the packet data segment of the frame
     /// pointed at by this descriptor.
     #[inline]
@@ -95,6 +128,27 @@ impl FrameDesc {
     #[inline]
     pub fn set_options(&mut self, options: u32) {
         self.options = options
+    }
+
+    /// Adjust addr backwards to include the headroom region in the data view.
+    ///
+    /// After this call, `umem.data(desc)` will return a slice starting at the
+    /// headroom region instead of the packet data segment. The caller should
+    /// set BufferGuard offset = headroom so that Deref still points to
+    /// the packet data.
+    ///
+    /// This allows retreat_offset() to access the physical headroom space
+    /// that the kernel reserved before the packet data.
+    #[inline]
+    pub fn addr_retreat(&mut self, bytes: usize) {
+        self.addr -= bytes;
+    }
+
+    /// Adjust addr forward (reverse of addr_retreat).
+    /// Used to restore addr before returning frame to fill queue.
+    #[inline]
+    pub fn addr_advance(&mut self, bytes: usize) {
+        self.addr += bytes;
     }
 
     #[inline]

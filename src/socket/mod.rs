@@ -248,3 +248,21 @@ impl Error for SocketCreateError {
         Some(self.err.borrow())
     }
 }
+
+impl Socket {
+    /// Update XSKMAP with this socket using the proper libxdp function.
+    /// This is the correct way to register AF_XDP sockets in XSKMAP.
+    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), Box<dyn Error>> {
+        let inner = self._inner.lock().map_err(|e| format!("Failed to lock socket: {}", e))?;
+        let xsk_ptr = inner._ptr.0.as_ptr();
+        
+        unsafe {
+            let ret = libxdp_sys::xsk_socket__update_xskmap(xsk_ptr, map_fd);
+            if ret < 0 {
+                return Err(format!("xsk_socket__update_xskmap failed: {}", ret).into());
+            }
+        }
+        
+        Ok(())
+    }
+}
