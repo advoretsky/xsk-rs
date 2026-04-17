@@ -31,6 +31,10 @@ use xsk_rs::{
     config::{LibxdpFlags, SocketConfig, UmemConfig},
 };
 
+// Deliberately duplicated from the library's internal constant to
+// avoid exporting it just for this example.
+const FRAME_COUNT: u32 = 64;
+
 #[allow(dead_code)]
 mod setup;
 use setup::{LinkIpAddr, PacketGenerator, VethDevConfig, util, veth_setup};
@@ -305,6 +309,8 @@ fn clear_cloexec(fd: RawFd) {
 }
 
 fn run_child() {
+    use std::os::fd::FromRawFd;
+
     println!("\n=== child (post-exec) ===");
     let socket_fd: RawFd = 3;
     let memfd: RawFd = 4;
@@ -319,38 +325,53 @@ fn run_child() {
         }
     }
 
-    probe_rings("child: inherited data socket", socket_fd);
+    // Raw probes (same as Phase 3) first — sanity check that the
+    // kernel still sees this FD as a live AF_XDP socket with rings.
+    probe_rings("child: raw ring probes on inherited FD", socket_fd);
 
-    // Probe the memfd: get its size via fstat, mmap it, scribble.
-    let mut st: libc::stat = unsafe { MaybeUninit::zeroed().assume_init() };
-    let rc = unsafe { libc::fstat(memfd, &mut st) };
-    if rc != 0 {
-        println!(
-            "  child fstat(memfd) FAIL: {}",
-            std::io::Error::last_os_error()
-        );
-    } else {
-        println!("  child fstat(memfd) OK size={} bytes", st.st_size);
-        let addr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                st.st_size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                memfd,
-                0,
-            )
-        };
-        if addr == libc::MAP_FAILED {
-            println!(
-                "  child mmap(memfd) FAIL: {}",
-                std::io::Error::last_os_error()
-            );
-        } else {
-            println!("  child mmap(memfd) OK at {:p}", addr);
-            unsafe { libc::munmap(addr, st.st_size as usize) };
-        }
+    // High-level reconstruction using the new fork APIs.
+    println!("\n=== child: reconstruct via Umem::from_memfd + Socket::from_raw_fd ===");
+
+    // Adopt the inherited FDs as OwnedFd so the fork manages teardown.
+    let memfd_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(memfd) };
+    let socket_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(socket_fd) };
+
+    let (umem, descs) = Umem::from_memfd(
+        UmemConfig::default(),
+        FRAME_COUNT.try_into().unwrap(),
+        memfd_owned,
+    )
+    .expect("Umem::from_memfd failed");
+    println!("  Umem::from_memfd OK — {} frames", descs.len());
+
+    let sock_cfg = SocketConfig::builder()
+        .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
+        .build();
+
+    let (tx_q, rx_q, fq_and_cq) = unsafe {
+        Socket::from_raw_fd(sock_cfg, &umem, socket_owned)
+            .expect("Socket::from_raw_fd failed")
+    };
+    println!("  Socket::from_raw_fd OK");
+    let (fq, cq) = fq_and_cq.expect("missing fill/comp queues");
+    println!(
+        "  TxQueue/RxQueue/FillQueue/CompQueue alive — new data-socket FD = {}",
+        tx_q.fd().as_raw_fd()
+    );
+
+    // Try a getsockopt via the xsk-rs Fd wrapper just to exercise it.
+    match tx_q.fd().xdp_statistics() {
+        Ok(_) => println!("  Fd::xdp_statistics OK on reconstructed socket"),
+        Err(e) => println!("  Fd::xdp_statistics FAIL: {e}"),
     }
+
+    // Explicit drop order: queues first, then umem.
+    drop(cq);
+    drop(fq);
+    drop(rx_q);
+    drop(tx_q);
+    drop(umem);
+    println!("  child: reconstructed queues + UMEM dropped cleanly");
 }
 
 fn main() {

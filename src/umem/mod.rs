@@ -76,17 +76,56 @@ impl Drop for XskUmem {
 /// socket for the first time with this [`Umem`]. Hence we store them
 /// here so we don't prematurely clear up the rings' memory between
 /// creating the [`Umem`] and creating the socket.
+/// Ring mmap regions backing a restored [`Umem`]'s Fill/Completion
+/// queues. See `crouter/docs/xdp_reexec_investigation.md`. A libxdp
+/// UMEM already owns these via the C `xsk_umem` struct and frees them
+/// on `xsk_umem__delete`, so this is only populated when the UMEM was
+/// reconstructed from an inherited memfd + socket FD.
+#[derive(Debug)]
+struct RestoredRingRegion {
+    addr: *mut libc::c_void,
+    len: usize,
+}
+
+unsafe impl Send for RestoredRingRegion {}
+
+impl Drop for RestoredRingRegion {
+    fn drop(&mut self) {
+        let err = unsafe { libc::munmap(self.addr, self.len) };
+        if err != 0 {
+            error!(
+                "munmap of restored ring region failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UmemInner {
-    ptr: XskUmem,
+    // `None` for UMEMs reconstructed from an inherited memfd — the
+    // successor never has a libxdp `xsk_umem *` because the kernel
+    // binding lives on the inherited socket FD, not on libxdp's C
+    // struct. See docs/xdp_reexec_investigation.md (crouter #117).
+    ptr: Option<XskUmem>,
     saved_fq_and_cq: Option<(Box<XskRingProd>, Box<XskRingCons>)>,
+    // When non-empty, these regions back Fill/Completion ring pointers
+    // reachable via the saved_fq_and_cq rings (or copies of them held
+    // by FillQueue/CompQueue). Kept alive by the `Arc<Mutex<UmemInner>>`
+    // that FillQueue/CompQueue clone. Dropped (and munmapped) after
+    // the last queue referencing them is gone.
+    restored_fc_regions: Vec<RestoredRingRegion>,
 }
 
 impl UmemInner {
-    fn new(ptr: XskUmem, saved_fq_and_cq: Option<(Box<XskRingProd>, Box<XskRingCons>)>) -> Self {
+    fn new(
+        ptr: Option<XskUmem>,
+        saved_fq_and_cq: Option<(Box<XskRingProd>, Box<XskRingCons>)>,
+    ) -> Self {
         Self {
             ptr,
             saved_fq_and_cq,
+            restored_fc_regions: Vec::new(),
         }
     }
 }
@@ -175,7 +214,7 @@ impl Umem {
             });
         }
 
-        let inner = UmemInner::new(umem_ptr, Some((fq, cq)));
+        let inner = UmemInner::new(Some(umem_ptr), Some((fq, cq)));
 
         let frame_count = frame_count.get() as usize;
 
@@ -186,6 +225,53 @@ impl Umem {
                 + frame_layout.xdp_headroom
                 + frame_layout.frame_headroom;
 
+            frame_descs.push(FrameDesc::new(addr));
+        }
+
+        let umem = Umem {
+            inner: Arc::new(Mutex::new(inner)),
+            mem,
+        };
+
+        Ok((umem, frame_descs))
+    }
+
+    /// Rebuild a [`Umem`] in a successor process from an inherited
+    /// memfd. No libxdp UMEM is created — the kernel UMEM is kept
+    /// alive by an AF_XDP socket FD that must also be inherited (use
+    /// [`crate::Socket::from_raw_fd`] for that side).
+    ///
+    /// `config` and `frame_count` must match the values used when the
+    /// UMEM was originally registered; otherwise ring addresses will
+    /// not line up with what the kernel sees.
+    ///
+    /// Returns the Umem wrapper and a fresh `Vec<FrameDesc>` indexed
+    /// 0..frame_count. In-flight descriptors at handoff must be
+    /// re-derived by the caller from the serialized handoff state —
+    /// this function only rebuilds the layout.
+    #[cfg(not(test))]
+    pub fn from_memfd(
+        config: UmemConfig,
+        frame_count: NonZeroU32,
+        memfd: std::os::fd::OwnedFd,
+    ) -> Result<(Self, Vec<FrameDesc>), UmemCreateError> {
+        let frame_layout = config.into();
+
+        let mem = UmemRegion::from_memfd(frame_count, frame_layout, memfd).map_err(|e| {
+            UmemCreateError {
+                reason: "failed to mmap inherited memfd",
+                err: e,
+            }
+        })?;
+
+        let inner = UmemInner::new(None, None);
+
+        let frame_count_usize = frame_count.get() as usize;
+        let mut frame_descs: Vec<FrameDesc> = Vec::with_capacity(frame_count_usize);
+        for i in 0..frame_count_usize {
+            let addr = (i * frame_layout.frame_size())
+                + frame_layout.xdp_headroom
+                + frame_layout.frame_headroom;
             frame_descs.push(FrameDesc::new(addr));
         }
 
@@ -340,7 +426,12 @@ impl Umem {
     /// inherit it to refill RX buffers and reap TX completions.
     pub fn fd(&self) -> std::os::fd::RawFd {
         let inner = self.inner.lock().unwrap();
-        unsafe { libxdp_sys::xsk_umem__fd(inner.ptr.as_mut_ptr()) }
+        match inner.ptr.as_ref() {
+            Some(p) => unsafe { libxdp_sys::xsk_umem__fd(p.as_mut_ptr()) },
+            // Restored UMEMs have no libxdp handle; the caller instead
+            // holds the AF_XDP socket FD that was inherited at exec().
+            None => -1,
+        }
     }
 
     /// Intended to be called on socket creation, this passes the
@@ -357,7 +448,27 @@ impl Umem {
     {
         let mut inner = self.inner.lock().unwrap();
 
-        f(inner.ptr.as_mut_ptr(), &mut inner.saved_fq_and_cq)
+        let ptr = inner
+            .ptr
+            .as_ref()
+            .expect(
+                "Umem reconstructed via from_memfd has no libxdp pointer; \
+                 use Socket::from_raw_fd to rebuild the socket side",
+            )
+            .as_mut_ptr();
+
+        f(ptr, &mut inner.saved_fq_and_cq)
+    }
+
+    /// Transfer ownership of a restored Fill/Completion ring mmap into
+    /// the Umem so it lives as long as any [`FillQueue`]/[`CompQueue`]
+    /// derived from it. Only used by [`crate::Socket::from_raw_fd`].
+    #[cfg(not(test))]
+    pub(crate) fn inner_attach_restored_fc(&self, addr: *mut libc::c_void, len: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .restored_fc_regions
+            .push(RestoredRingRegion { addr, len });
     }
 }
 

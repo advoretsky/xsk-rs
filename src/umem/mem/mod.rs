@@ -60,6 +60,34 @@ impl UmemRegion {
         })
     }
 
+    /// Rebuild a [`UmemRegion`] from an inherited memfd without going
+    /// through libxdp. The memfd must describe a UMEM region that was
+    /// previously registered with the kernel via an AF_XDP socket; the
+    /// same socket FD must be inherited separately so the successor
+    /// can access the kernel UMEM binding.
+    ///
+    /// See `crouter/docs/xdp_reexec_investigation.md` for the lifetime
+    /// model this assumes.
+    #[cfg(not(test))]
+    pub(crate) fn from_memfd(
+        frame_count: NonZeroU32,
+        frame_layout: FrameLayout,
+        memfd: std::os::fd::OwnedFd,
+    ) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let len = (frame_count.get() as usize) * frame_layout.frame_size();
+        let raw_fd = memfd.as_raw_fd();
+        let mmap = Mmap::from_fd(memfd, len)?;
+
+        Ok(Self {
+            layout: frame_layout,
+            addr: mmap.addr(),
+            len,
+            memfd: raw_fd,
+            _mmap: Arc::new(Mutex::new(mmap)),
+        })
+    }
+
     /// The size of the underlying memory region.
     #[inline]
     pub fn len(&self) -> usize {
