@@ -33,7 +33,7 @@ use std::{
 };
 use tokio::runtime::Runtime;
 use xsk_rs::{
-    Socket, Umem,
+    CompQueue, FrameDesc, Socket, TxQueue, Umem,
     config::{LibxdpFlags, SocketConfig, UmemConfig},
 };
 
@@ -43,6 +43,23 @@ use setup::{LinkIpAddr, PacketGenerator, VethDevConfig, util, veth_setup};
 
 const HANDOFF_UDS: &str = "/tmp/xsk-handoff.sock";
 const FRAME_COUNT: u32 = 64;
+const BURST_PACKETS: usize = 1000;
+const BURST_BATCH: usize = 16;
+
+// Minimal ethernet frame: 6 dst + 6 src + 2 ethertype + payload padding.
+// Not routable — veth peer will toss it, but we only care that the
+// kernel accepts it into the TX path and delivers a completion.
+const TEST_FRAME: [u8; 64] = [
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // dst MAC (locally-administered)
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // src MAC
+    0x08, 0x00, // ethertype IPv4
+    // 50 bytes of "handoff-demo" padding
+    b'h', b'a', b'n', b'd', b'o', b'f', b'f', b'-', b'd', b'e',
+    b'm', b'o', b'-', b'p', b'k', b't', b'-', b'-', b'-', b'-',
+    b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+    b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+    b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-', b'-',
+];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -152,7 +169,7 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
         .build();
 
-    let (tx_q, _rx_q, _fq_cq) = unsafe {
+    let (mut tx_q, _rx_q, fq_cq) = unsafe {
         Socket::new(
             sock_cfg,
             &umem,
@@ -161,6 +178,7 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         )
     }
     .expect("Socket::new");
+    let (_fq, mut cq) = fq_cq.expect("fill/comp queues present");
 
     let socket_fd = tx_q.fd().as_raw_fd();
     let memfd = umem.memfd();
@@ -171,6 +189,15 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         "server: UMEM ready ({} frames), socket_fd={socket_fd}, memfd={memfd}",
         descs.len()
     );
+
+    // Seed our free pool with every frame and run a pre-handoff TX
+    // burst. Drains completions so all frames are back in `free` by
+    // the time we hand off.
+    let mut free: Vec<FrameDesc> = descs;
+    let (pre_sub, pre_cmp) = tx_burst(&umem, &mut tx_q, &mut cq, &mut free, BURST_PACKETS)
+        .expect("server pre-handoff tx_burst");
+    println!("server: pre-handoff tx_burst submitted={pre_sub} completed={pre_cmp}");
+    assert_eq!(pre_sub, pre_cmp, "server: TX accounting mismatch");
 
     // Accept one successor and send it the bundle.
     let (mut client, addr) = listener.accept().expect("accept");
@@ -219,7 +246,7 @@ fn run_receiver(path: PathBuf) {
     let socket_fd = fds_iter.next().unwrap();
     let memfd = fds_iter.next().unwrap();
 
-    let (umem, descs) = Umem::from_memfd(
+    let (umem, mut descs) = Umem::from_memfd(
         UmemConfig::default(),
         payload.frame_count.try_into().unwrap(),
         memfd,
@@ -237,10 +264,10 @@ fn run_receiver(path: PathBuf) {
         )
         .build();
 
-    let (tx_q, rx_q, fq_cq) = unsafe {
+    let (mut tx_q, rx_q, fq_cq) = unsafe {
         Socket::from_raw_fd(sock_cfg, &umem, socket_fd).expect("Socket::from_raw_fd")
     };
-    let (fq, cq) = fq_cq.expect("fill/comp queues");
+    let (fq, mut cq) = fq_cq.expect("fill/comp queues");
     println!(
         "receiver: Socket::from_raw_fd OK (new fd={})",
         tx_q.fd().as_raw_fd()
@@ -251,6 +278,15 @@ fn run_receiver(path: PathBuf) {
         Err(e) => println!("receiver: xdp_statistics FAIL: {e}"),
     }
 
+    // The server drained its TX ring before handoff, so every frame
+    // in `descs` is free. Run an identical burst from the receiver
+    // side to prove TX still flows on the reconstructed rings.
+    let mut free: Vec<FrameDesc> = descs.drain(..).collect();
+    let (post_sub, post_cmp) = tx_burst(&umem, &mut tx_q, &mut cq, &mut free, BURST_PACKETS)
+        .expect("receiver post-handoff tx_burst");
+    println!("receiver: post-handoff tx_burst submitted={post_sub} completed={post_cmp}");
+    assert_eq!(post_sub, post_cmp, "receiver: TX accounting mismatch");
+
     // Signal to the server that we have full possession and are happy.
     stream.write_all(b"READY").expect("send READY");
     println!("receiver: READY sent; cleaning up and exiting");
@@ -260,6 +296,59 @@ fn run_receiver(path: PathBuf) {
     drop(rx_q);
     drop(tx_q);
     drop(umem);
+}
+
+// ---------------------- shared TX burst ----------------------
+//
+// Drive the AF_XDP TX ring for `n_pkts` submissions, reclaiming
+// completions as they arrive. Returns (submitted, completed). If the
+// ring is healthy both numbers match `n_pkts`.
+
+fn tx_burst(
+    umem: &Umem,
+    tx_q: &mut TxQueue,
+    cq: &mut CompQueue,
+    free: &mut Vec<FrameDesc>,
+    n_pkts: usize,
+) -> io::Result<(usize, usize)> {
+    use std::io::Write as _;
+
+    let mut submitted = 0usize;
+    let mut completed = 0usize;
+    let mut scratch = [FrameDesc::default(); BURST_BATCH];
+
+    while completed < n_pkts {
+        // Submit a batch of frames from the free pool.
+        let to_send = (n_pkts - submitted).min(free.len()).min(BURST_BATCH);
+        if to_send > 0 {
+            let mut batch: Vec<FrameDesc> = free.drain(..to_send).collect();
+            for d in &mut batch {
+                unsafe {
+                    umem.data_mut(d).cursor().write_all(&TEST_FRAME)?;
+                }
+            }
+            let sent = unsafe { tx_q.produce_and_wakeup(&batch)? };
+            submitted += sent;
+            if sent < batch.len() {
+                // Any frame rejected by the ring goes back to free.
+                free.extend(batch.into_iter().skip(sent));
+            }
+        }
+
+        // Reap completions.
+        let got = unsafe { cq.consume(&mut scratch) };
+        if got > 0 {
+            completed += got;
+            for d in &scratch[..got] {
+                free.push(*d);
+            }
+        }
+
+        if to_send == 0 && got == 0 {
+            thread::sleep(Duration::from_micros(100));
+        }
+    }
+    Ok((submitted, completed))
 }
 
 // ---------------------- SCM_RIGHTS wire helpers ----------------------
