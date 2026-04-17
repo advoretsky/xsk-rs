@@ -330,6 +330,19 @@ impl Umem {
         self.mem.memfd()
     }
 
+    /// libxdp-owned AF_XDP socket FD that holds the kernel UMEM
+    /// registration and Fill/Completion ring mmaps. Distinct from any
+    /// per-queue data socket FD returned by [`crate::Socket::new`].
+    ///
+    /// Needed for re-exec handoff because the Fill/Comp rings are
+    /// mmapped from this FD via `XDP_UMEM_PGOFF_FILL_RING` /
+    /// `XDP_UMEM_PGOFF_COMPLETION_RING` offsets; the successor must
+    /// inherit it to refill RX buffers and reap TX completions.
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        let inner = self.inner.lock().unwrap();
+        unsafe { libxdp_sys::xsk_umem__fd(inner.ptr.as_mut_ptr()) }
+    }
+
     /// Intended to be called on socket creation, this passes the
     /// create function a pointer to the UMEM and any saved fill queue
     /// or completion queue.
