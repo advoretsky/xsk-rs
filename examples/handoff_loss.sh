@@ -9,13 +9,47 @@
 
 set -eu -o pipefail
 
-ITER="${1:-20}"
+ITER=20
+IFACE=""
+ZEROCOPY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --interface)
+            IFACE="$2"
+            shift 2
+            ;;
+        --zero-copy)
+            ZEROCOPY=1
+            shift
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                ITER="$1"
+                shift
+            else
+                echo "usage: $0 [iterations] [--interface NAME] [--zero-copy]" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
 FORK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${FORK_DIR}/target/release/examples/handoff_demo"
 UDS="/tmp/xsk-handoff.sock"
 LOG_DIR="/tmp/handoff_loss_logs"
 MAX_HANDOFF_US=100000       # 100 ms
 MAX_FAILED_ITERS=0
+
+SERVER_ARGS=(--role server)
+if [[ -n "$IFACE" ]]; then
+    SERVER_ARGS+=(--interface "$IFACE")
+fi
+if [[ "$ZEROCOPY" == "1" ]]; then
+    SERVER_ARGS+=(--zero-copy)
+fi
+echo "handoff_loss: ITER=$ITER IFACE='${IFACE:-veth}' ZC=$ZEROCOPY"
 
 if [[ ! -x "$BIN" ]]; then
     echo "building handoff_demo…" >&2
@@ -47,7 +81,9 @@ parse_us() {
 
 cleanup() {
     # Best effort; ignore failures.
-    ip link del hdveth_a 2>/dev/null || true
+    if [[ -z "$IFACE" ]]; then
+        ip link del hdveth_a 2>/dev/null || true
+    fi
     rm -f "$UDS" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -56,7 +92,7 @@ for i in $(seq 1 "$ITER"); do
     cleanup
     log="${LOG_DIR}/run_${i}.log"
 
-    "$BIN" --role server >"$log" 2>&1 &
+    "$BIN" "${SERVER_ARGS[@]}" >"$log" 2>&1 &
     server_wrapper=$!
 
     # Wait until the server has entered its TX loop.
@@ -113,6 +149,14 @@ for i in $(seq 1 "$ITER"); do
         worst_us="$window_us"
     fi
     printf "iter %3d: handoff_window=%s (%sµs) — OK\n" "$i" "$window" "$window_us"
+
+    # Give the kernel time to fully release the AF_XDP queue binding
+    # before the next iteration tries to bind again — otherwise
+    # xsk_socket__create_shared returns EBUSY. Only matters on real
+    # NICs; veth releases immediately.
+    if [[ -n "$IFACE" ]]; then
+        sleep 0.5
+    fi
 done
 
 echo

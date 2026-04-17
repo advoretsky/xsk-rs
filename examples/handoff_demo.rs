@@ -36,7 +36,7 @@ use std::{
 use tokio::runtime::Runtime;
 use xsk_rs::{
     CompQueue, FrameDesc, Socket, TxQueue, Umem,
-    config::{LibxdpFlags, SocketConfig, UmemConfig},
+    config::{BindFlags, LibxdpFlags, SocketConfig, UmemConfig},
 };
 
 #[allow(dead_code)]
@@ -93,12 +93,22 @@ struct HandoffPayload {
 
 unsafe impl Send for HandoffPayload {}
 
+#[derive(Debug, Clone)]
+struct ServerOpts {
+    interface: Option<String>,
+    zero_copy: bool,
+}
+
 enum Role {
-    Server,
+    Server(ServerOpts),
     Receiver(PathBuf),
 }
 
 fn parse_role() -> Role {
+    let mut opts = ServerOpts {
+        interface: None,
+        zero_copy: false,
+    };
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -108,12 +118,16 @@ fn parse_role() -> Role {
             }
             "--role" => {
                 let v = args.next().expect("--role needs a value");
-                if v == "server" {
-                    return Role::Server;
-                } else {
+                if v != "server" {
                     eprintln!("unknown --role {v}, expected 'server'");
                     process::exit(2);
                 }
+            }
+            "--interface" => {
+                opts.interface = Some(args.next().expect("--interface needs a name"));
+            }
+            "--zero-copy" => {
+                opts.zero_copy = true;
             }
             other => {
                 eprintln!("unknown argument {other}");
@@ -121,20 +135,37 @@ fn parse_role() -> Role {
             }
         }
     }
-    Role::Server
+    Role::Server(opts)
 }
 
 fn main() {
     env_logger::init();
     match parse_role() {
-        Role::Server => run_server(),
+        Role::Server(opts) => run_server(opts),
         Role::Receiver(path) => run_receiver(path),
     }
 }
 
 // ---------------------- server side ----------------------
 
-fn run_server() {
+fn run_server(opts: ServerOpts) {
+    // Pre-bind the UDS before spawning the veth/AF_XDP setup so a
+    // concurrently started receiver never loses its connect() race.
+    let _ = std::fs::remove_file(HANDOFF_UDS);
+    let listener = UnixListener::bind(HANDOFF_UDS).expect("bind UDS");
+    println!("server listening on {HANDOFF_UDS}");
+
+    if let Some(iface) = opts.interface.clone() {
+        // Bare-metal path: the NIC already exists, no veth setup.
+        // We don't bring XDP up ourselves — the test harness does so
+        // once, outside the iteration loop, to avoid carrier drops.
+        server_body_iface(iface, opts.zero_copy, listener);
+        let _ = std::fs::remove_file(HANDOFF_UDS);
+        println!("server exited");
+        return;
+    }
+
+    // Veth sandbox path (default).
     let dev1 = VethDevConfig {
         if_name: "hdveth_a".into(),
         addr: [0xf6, 0xe0, 0xf6, 0xc9, 0x60, 0x1a],
@@ -145,12 +176,6 @@ fn run_server() {
         addr: [0x4a, 0xf1, 0x30, 0xeb, 0x0d, 0x41],
         ip_addr: LinkIpAddr::new(Ipv4Addr::new(192, 168, 170, 2), 24),
     };
-
-    // Pre-bind the UDS before spawning the veth/AF_XDP setup so a
-    // concurrently started receiver never loses its connect() race.
-    let _ = std::fs::remove_file(HANDOFF_UDS);
-    let listener = UnixListener::bind(HANDOFF_UDS).expect("bind UDS");
-    println!("server listening on {HANDOFF_UDS}");
 
     let ctrl_c_events = util::ctrl_channel().unwrap();
     let (complete_tx, complete_rx) = crossbeam_channel::bounded(1);
@@ -174,6 +199,47 @@ fn run_server() {
     println!("server exited");
 }
 
+fn server_body_iface(interface: String, zero_copy: bool, listener: UnixListener) {
+    install_sigusr1_handler();
+
+    // igb ZEROCOPY requires frame_headroom=64 and default frame_size
+    // (see crouter CLAUDE.md). UmemConfig::default has both.
+    let (umem, descs) = Umem::new(
+        UmemConfig::default(),
+        FRAME_COUNT.try_into().unwrap(),
+        false,
+    )
+    .expect("Umem::new");
+
+    let mut builder = SocketConfig::builder();
+    builder.libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD);
+    if zero_copy {
+        builder.bind_flags(BindFlags::XDP_ZEROCOPY | BindFlags::XDP_USE_NEED_WAKEUP);
+    }
+    let sock_cfg = builder.build();
+
+    let (mut tx_q, _rx_q, fq_cq) = unsafe {
+        Socket::new(
+            sock_cfg,
+            &umem,
+            &interface.parse().unwrap(),
+            0,
+        )
+    }
+    .expect("Socket::new on interface (is XDP attached for ZEROCOPY?)");
+    let (_fq, mut cq) = fq_cq.expect("fill/comp queues present");
+
+    run_server_loop(
+        umem,
+        descs,
+        tx_q,
+        cq,
+        sock_cfg,
+        listener,
+        format!("bare-metal {interface} zero_copy={zero_copy}"),
+    )
+}
+
 fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
     install_sigusr1_handler();
 
@@ -188,7 +254,7 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
         .build();
 
-    let (mut tx_q, _rx_q, fq_cq) = unsafe {
+    let (tx_q, _rx_q, fq_cq) = unsafe {
         Socket::new(
             sock_cfg,
             &umem,
@@ -197,15 +263,27 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         )
     }
     .expect("Socket::new");
-    let (_fq, mut cq) = fq_cq.expect("fill/comp queues present");
+    let (_fq, cq) = fq_cq.expect("fill/comp queues present");
 
+    run_server_loop(umem, descs, tx_q, cq, sock_cfg, listener, "veth".into())
+}
+
+fn run_server_loop(
+    umem: Umem,
+    descs: Vec<FrameDesc>,
+    mut tx_q: TxQueue,
+    mut cq: CompQueue,
+    sock_cfg: SocketConfig,
+    listener: UnixListener,
+    tag: String,
+) {
     let socket_fd = tx_q.fd().as_raw_fd();
     let memfd = umem.memfd();
     let rx_ring_size = sock_cfg.rx_queue_size().get();
     let tx_ring_size = sock_cfg.tx_queue_size().get();
 
     println!(
-        "server: UMEM ready ({} frames), socket_fd={socket_fd}, memfd={memfd}",
+        "server[{tag}]: UMEM ready ({} frames), socket_fd={socket_fd}, memfd={memfd}",
         descs.len()
     );
     println!("server: send SIGUSR1 to trigger handoff (pid={})", process::id());
