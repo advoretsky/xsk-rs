@@ -22,14 +22,16 @@
 use std::{
     convert::TryInto,
     env,
-    io::{self, IoSlice, IoSliceMut, Read, Write},
+    io::{self, ErrorKind, IoSlice, IoSliceMut, Read, Write},
     mem::{MaybeUninit, size_of},
     net::Ipv4Addr,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
-    process, ptr, thread,
-    time::Duration,
+    process, ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 use xsk_rs::{
@@ -45,6 +47,21 @@ const HANDOFF_UDS: &str = "/tmp/xsk-handoff.sock";
 const FRAME_COUNT: u32 = 64;
 const BURST_PACKETS: usize = 1000;
 const BURST_BATCH: usize = 16;
+
+// Signal-driven handoff: when the user sends SIGUSR1, the server
+// spawns its own successor and transfers state over the UDS. The
+// handler is async-signal-safe (just an atomic flip).
+static HANDOFF_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigusr1(_sig: libc::c_int) {
+    HANDOFF_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_sigusr1_handler() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_sigusr1 as libc::sighandler_t);
+    }
+}
 
 // Minimal ethernet frame: 6 dst + 6 src + 2 ethertype + payload padding.
 // Not routable — veth peer will toss it, but we only care that the
@@ -158,6 +175,8 @@ fn run_server() {
 }
 
 fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
+    install_sigusr1_handler();
+
     let (umem, descs) = Umem::new(
         UmemConfig::default(),
         FRAME_COUNT.try_into().unwrap(),
@@ -189,20 +208,69 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
         "server: UMEM ready ({} frames), socket_fd={socket_fd}, memfd={memfd}",
         descs.len()
     );
+    println!("server: send SIGUSR1 to trigger handoff (pid={})", process::id());
 
-    // Seed our free pool with every frame and run a pre-handoff TX
-    // burst. Drains completions so all frames are back in `free` by
-    // the time we hand off.
+    // Non-blocking so the TX loop can poll both signal state and
+    // (once we've spawned a successor) the incoming UDS connection.
+    listener.set_nonblocking(true).expect("listener nonblocking");
+
     let mut free: Vec<FrameDesc> = descs;
-    let (pre_sub, pre_cmp) = tx_burst(&umem, &mut tx_q, &mut cq, &mut free, BURST_PACKETS)
-        .expect("server pre-handoff tx_burst");
-    println!("server: pre-handoff tx_burst submitted={pre_sub} completed={pre_cmp}");
-    assert_eq!(pre_sub, pre_cmp, "server: TX accounting mismatch");
+    let mut submitted: u64 = 0;
+    let mut completed: u64 = 0;
 
-    // Accept one successor and send it the bundle.
-    let (mut client, addr) = listener.accept().expect("accept");
-    println!("server: receiver connected from {:?}", addr);
+    // --- phase 1: steady-state TX until SIGUSR1 ---
+    while !HANDOFF_REQUESTED.load(Ordering::SeqCst) {
+        tx_step(&umem, &mut tx_q, &mut cq, &mut free, &mut submitted, &mut completed);
+    }
 
+    let handoff_start = Instant::now();
+    println!(
+        "server: SIGUSR1 received after submitted={submitted} completed={completed}; \
+         spawning successor"
+    );
+
+    // Spawn the successor as a sibling process. It starts from scratch
+    // and connects back to our UDS — no FD inheritance needed.
+    let self_exe = env::current_exe().expect("current_exe");
+    let child = std::process::Command::new(&self_exe)
+        .arg("--handoff-from")
+        .arg(HANDOFF_UDS)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("spawn successor");
+    println!("server: spawned successor pid={}", child.id());
+
+    // --- phase 2: keep TX flowing while the successor starts, then
+    // accept its connection when it's ready. This is the key zero-loss
+    // ingredient — no idle gap while the new process initializes. ---
+    let client = loop {
+        tx_step(&umem, &mut tx_q, &mut cq, &mut free, &mut submitted, &mut completed);
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    let t_connected = handoff_start.elapsed();
+    println!(
+        "server: successor connected after {:?} \
+         (submitted={submitted} completed={completed})"
+        , t_connected
+    );
+
+    // --- phase 3: quiesce — no more submissions; drain completions. ---
+    let drain_start = Instant::now();
+    while completed < submitted {
+        drain_step(&mut cq, &mut free, &mut completed);
+    }
+    let t_drain = drain_start.elapsed();
+    println!(
+        "server: TX drained in {:?} (final submitted={submitted} completed={completed})",
+        t_drain
+    );
+
+    // --- phase 4: bundle + READY handshake. ---
     let payload = HandoffPayload {
         frame_count: FRAME_COUNT,
         rx_ring_size,
@@ -211,24 +279,96 @@ fn server_body(dev: (VethDevConfig, PacketGenerator), listener: UnixListener) {
     };
 
     send_bundle(&client, &[socket_fd, memfd], &payload).expect("send_bundle");
-    println!("server: bundle sent; awaiting READY");
 
+    let mut client = client; // rebind mutable
     let mut buf = [0u8; 16];
     let n = client.read(&mut buf).expect("read READY");
-    let ack = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
-    println!("server: got ack {ack:?}");
-
-    // In a real handoff we would drain TX completions, close the
-    // socket/memfd, and then return. Stage 1 has no TX traffic, so we
-    // just let scope-end do the cleanup.
+    println!(
+        "server: ack={:?} handoff_window={:?}",
+        std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>"),
+        handoff_start.elapsed()
+    );
     drop(client);
+
+    // We wait for the child to exit so its output is captured before
+    // we return and the veth fixture is torn down.
+    let status = child.wait_with_output().expect("wait child");
+    println!(
+        "server: successor exited with status={} stdout_lines={}",
+        status.status,
+        status.stdout.split(|b| *b == b'\n').count()
+    );
+}
+
+// Try to submit one batch and reap completions; non-blocking, returns
+// quickly if nothing to do.
+fn tx_step(
+    umem: &Umem,
+    tx_q: &mut TxQueue,
+    cq: &mut CompQueue,
+    free: &mut Vec<FrameDesc>,
+    submitted: &mut u64,
+    completed: &mut u64,
+) {
+    use std::io::Write as _;
+    let to_send = BURST_BATCH.min(free.len());
+    if to_send > 0 {
+        let mut batch: Vec<FrameDesc> = free.drain(..to_send).collect();
+        for d in &mut batch {
+            unsafe {
+                umem.data_mut(d).cursor().write_all(&TEST_FRAME).unwrap();
+            }
+        }
+        let sent = unsafe { tx_q.produce_and_wakeup(&batch).unwrap() };
+        *submitted += sent as u64;
+        if sent < batch.len() {
+            free.extend(batch.into_iter().skip(sent));
+        }
+    }
+    let mut scratch = [FrameDesc::default(); BURST_BATCH];
+    let got = unsafe { cq.consume(&mut scratch) };
+    if got > 0 {
+        *completed += got as u64;
+        for d in &scratch[..got] {
+            free.push(*d);
+        }
+    }
+}
+
+fn drain_step(cq: &mut CompQueue, free: &mut Vec<FrameDesc>, completed: &mut u64) {
+    let mut scratch = [FrameDesc::default(); BURST_BATCH];
+    let got = unsafe { cq.consume(&mut scratch) };
+    if got > 0 {
+        *completed += got as u64;
+        for d in &scratch[..got] {
+            free.push(*d);
+        }
+    } else {
+        thread::sleep(Duration::from_micros(50));
+    }
 }
 
 // ---------------------- receiver side ----------------------
 
 fn run_receiver(path: PathBuf) {
-    println!("receiver: connecting to {}", path.display());
-    let mut stream = UnixStream::connect(&path).expect("connect UDS");
+    let t0 = Instant::now();
+    println!("receiver: pid={} connecting to {}", process::id(), path.display());
+    // The server is running TX while we come up; it will accept our
+    // connection within its next loop iteration. A small retry loop
+    // covers the race where we hit the socket before the server
+    // finished binding.
+    let mut stream = loop {
+        match UnixStream::connect(&path) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == ErrorKind::NotFound
+                || e.kind() == ErrorKind::ConnectionRefused =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("connect UDS: {e}"),
+        }
+    };
+    println!("receiver: UDS connected in {:?}", t0.elapsed());
 
     let (fds, payload) = recv_bundle(&stream, 2).expect("recv_bundle");
     assert_eq!(fds.len(), 2, "expected 2 FDs (socket, memfd)");
@@ -279,17 +419,27 @@ fn run_receiver(path: PathBuf) {
     }
 
     // The server drained its TX ring before handoff, so every frame
-    // in `descs` is free. Run an identical burst from the receiver
-    // side to prove TX still flows on the reconstructed rings.
+    // in `descs` is free. Run a burst on the reconstructed rings to
+    // prove TX still flows, and to generate traffic that the loss
+    // harness can measure.
     let mut free: Vec<FrameDesc> = descs.drain(..).collect();
+    let tx_start = Instant::now();
     let (post_sub, post_cmp) = tx_burst(&umem, &mut tx_q, &mut cq, &mut free, BURST_PACKETS)
         .expect("receiver post-handoff tx_burst");
-    println!("receiver: post-handoff tx_burst submitted={post_sub} completed={post_cmp}");
+    println!(
+        "receiver: post-handoff tx_burst submitted={post_sub} completed={post_cmp} elapsed={:?}",
+        tx_start.elapsed()
+    );
     assert_eq!(post_sub, post_cmp, "receiver: TX accounting mismatch");
 
-    // Signal to the server that we have full possession and are happy.
+    // Signal to the server that we have full possession — the server
+    // kept TX flowing until it accepted our connection, so the
+    // kernel-visible "outage" is just the quiesce + bundle exchange.
     stream.write_all(b"READY").expect("send READY");
-    println!("receiver: READY sent; cleaning up and exiting");
+    println!(
+        "receiver: READY sent; total reconstruction+burst took {:?}",
+        t0.elapsed()
+    );
 
     drop(cq);
     drop(fq);
