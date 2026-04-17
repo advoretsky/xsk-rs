@@ -4,61 +4,119 @@ use std::{io, ptr::NonNull};
 
 #[cfg(not(test))]
 mod inner {
-    use libc::{
-        MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
-    };
+    use libc::{MAP_FAILED, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE};
     use log::error;
-    use std::ptr;
+    use std::{
+        ffi::CStr,
+        os::fd::{FromRawFd, OwnedFd, RawFd},
+        ptr,
+    };
 
     use super::*;
 
-    /// An anonymous memory mapped region.
+    // Backing the UMEM with a memfd (instead of MAP_ANONYMOUS) makes the
+    // memory region shareable across processes via SCM_RIGHTS, which is
+    // needed for zero-downtime re-exec handoff. The file descriptor is
+    // kept alive for the lifetime of the mapping.
     #[derive(Debug)]
     pub struct Mmap {
         addr: NonNull<libc::c_void>,
         len: usize,
+        fd: OwnedFd,
     }
 
     unsafe impl Send for Mmap {}
 
     impl Mmap {
         pub fn new(len: usize, use_huge_pages: bool) -> io::Result<Self> {
-            // MAP_ANONYMOUS: mapping not backed by a file.
-            // MAP_SHARED: shares this mapping, so changes are visible
-            // to other processes mapping the same file.
-            // MAP_POPULATE: pre-populate page tables, reduces
-            // blocking on page faults later.
-            let mut flags = MAP_ANONYMOUS | MAP_SHARED | MAP_POPULATE;
-
+            // MFD_CLOEXEC: don't leak FD across exec unless explicitly handed off.
+            // MFD_HUGETLB: back memfd with huge pages when requested.
+            let name = CStr::from_bytes_with_nul(b"xsk-rs-umem\0").unwrap();
+            let mut memfd_flags = libc::MFD_CLOEXEC;
             if use_huge_pages {
-                flags |= MAP_HUGETLB;
+                memfd_flags |= libc::MFD_HUGETLB;
             }
+
+            let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), memfd_flags as libc::c_uint) };
+            if raw_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+            if !use_huge_pages {
+                // Huge-page memfds refuse ftruncate (size is set at creation
+                // by the allocation itself); regular memfds need explicit sizing.
+                let rc = unsafe { libc::ftruncate(raw_fd, len as libc::off_t) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+
+            Self::from_fd(fd, len)
+        }
+
+        /// Map an existing memfd into this process. The fd is adopted
+        /// and closed when the returned `Mmap` is dropped.
+        ///
+        /// Fails cleanly if the fd's backing file is smaller than
+        /// `len`. Without that check Linux would happily create the
+        /// mapping (mmap doesn't require file coverage) and any
+        /// access past the file size would SIGBUS — turning a
+        /// misconfigured handoff payload into a crash far from the
+        /// root cause.
+        pub fn from_fd(fd: OwnedFd, len: usize) -> io::Result<Self> {
+            use std::os::fd::AsRawFd;
+
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (st.st_size as u64) < (len as u64) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "inherited fd is {} bytes but {} bytes were requested",
+                        st.st_size, len
+                    ),
+                ));
+            }
+
+            // MAP_SHARED: kernel-side UMEM registration sees the same
+            // physical pages as userspace.
+            // MAP_POPULATE: pre-populate page tables.
+            let flags = MAP_SHARED | MAP_POPULATE;
 
             let addr = unsafe {
                 libc::mmap(
                     ptr::null_mut(),
                     len,
-                    PROT_READ | PROT_WRITE, // prot
+                    PROT_READ | PROT_WRITE,
                     flags,
-                    -1, // file
-                    0,  // offset
+                    fd.as_raw_fd(),
+                    0,
                 )
             };
 
             if addr == MAP_FAILED {
-                Err(io::Error::last_os_error())
-            } else {
-                let addr =
-                    NonNull::new(addr).expect("ptr non-null since we confirmed `mmap()` succeeded");
-
-                Ok(Mmap { addr, len })
+                return Err(io::Error::last_os_error());
             }
+
+            let addr = NonNull::new(addr).expect("non-null after successful mmap");
+            Ok(Mmap { addr, len, fd })
         }
 
         /// Returns a pointer to the start of the mmap'd region.
         #[inline]
         pub fn addr(&self) -> NonNull<libc::c_void> {
             self.addr
+        }
+
+        /// Raw memfd descriptor. Caller must not close it.
+        #[inline]
+        pub fn as_raw_fd(&self) -> RawFd {
+            use std::os::fd::AsRawFd;
+            self.fd.as_raw_fd()
         }
     }
 
@@ -122,6 +180,13 @@ mod inner {
         #[inline]
         pub fn addr(&self) -> NonNull<libc::c_void> {
             NonNull::new(self.0.ptr.as_ptr() as *mut libc::c_void).unwrap()
+        }
+
+        /// Heap-backed mock has no real fd; return -1 to keep the
+        /// call-site shape identical to the real [`Mmap`].
+        #[inline]
+        pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            -1
         }
     }
 }

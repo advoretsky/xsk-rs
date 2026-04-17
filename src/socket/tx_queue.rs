@@ -3,7 +3,7 @@ use std::{io, os::unix::prelude::AsRawFd, ptr};
 
 use crate::{ring::XskRingProd, umem::frame::FrameDesc, util};
 
-use super::{Socket, fd::Fd};
+use super::{Socket, UpdateXskmapError, fd::Fd};
 
 /// The transmitting side of an AF_XDP [`Socket`].
 ///
@@ -209,7 +209,7 @@ impl TxQueue {
 
 impl TxQueue {
     /// Update XSKMAP with the underlying socket.
-    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), UpdateXskmapError> {
         self.socket.update_xskmap(map_fd)
     }
 }

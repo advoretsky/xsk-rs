@@ -14,12 +14,13 @@ use std::{
     borrow::Borrow,
     error::Error,
     fmt, io,
+    os::fd::{AsRawFd as _, OwnedFd},
     ptr::{self, NonNull},
     sync::{Arc, Mutex},
 };
 
 use crate::{
-    config::{Interface, SocketConfig},
+    config::{Interface, QueueSize, SocketConfig},
     ring::{XskRingCons, XskRingProd},
     umem::{CompQueue, FillQueue, Umem},
 };
@@ -53,18 +54,67 @@ impl Drop for XskSocket {
 
 unsafe impl Send for XskSocket {}
 
+// A socket created via libxdp closes its FD via `xsk_socket__delete`.
+// A socket reconstructed from an inherited FD has no libxdp handle, so
+// we own the FD directly and let `OwnedFd::drop` close it. The
+// `OwnedFd` is structurally unread — its job is to close at drop —
+// which would otherwise trip the dead-code lint.
+#[derive(Debug)]
+enum SocketOwner {
+    Libxdp(XskSocket),
+    Inherited(#[allow(dead_code)] OwnedFd),
+}
+
+/// Tracks a raw `mmap` region we own ourselves (Path A reconstruction).
+#[derive(Debug)]
+struct RawMmap {
+    addr: *mut libc::c_void,
+    len: usize,
+}
+
+unsafe impl Send for RawMmap {}
+
+impl Drop for RawMmap {
+    fn drop(&mut self) {
+        let err = unsafe { libc::munmap(self.addr, self.len) };
+        if err != 0 {
+            // Matches xsk-rs's existing failure-logging style elsewhere.
+            log::error!(
+                "munmap of ring region failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SocketInner {
-    // `ptr` must appear before `umem` to ensure correct drop order.
-    _ptr: XskSocket,
+    // `owner` must appear before `umem` to ensure correct drop order.
+    owner: SocketOwner,
     _umem: Umem,
+    // RX/TX ring mmap regions when `owner` is `Inherited`. Empty for
+    // libxdp-created sockets (xsk_socket__delete unmaps those).
+    // Dropped after `owner` closes the FD (struct field order +
+    // Vec<RawMmap> Drop). The field is structurally unread — its job
+    // is to munmap at drop — so the dead-code lint is silenced.
+    #[allow(dead_code)]
+    rx_tx_mmaps: Vec<RawMmap>,
 }
 
 impl SocketInner {
-    fn new(ptr: XskSocket, umem: Umem) -> Self {
+    fn new_libxdp(ptr: XskSocket, umem: Umem) -> Self {
         Self {
-            _ptr: ptr,
+            owner: SocketOwner::Libxdp(ptr),
             _umem: umem,
+            rx_tx_mmaps: Vec::new(),
+        }
+    }
+
+    fn new_inherited(fd: OwnedFd, umem: Umem) -> Self {
+        Self {
+            owner: SocketOwner::Inherited(fd),
+            _umem: umem,
+            rx_tx_mmaps: Vec::new(),
         }
     }
 }
@@ -180,7 +230,7 @@ impl Socket {
 
         let socket = Socket {
             fd: Fd::new(fd),
-            _inner: Arc::new(Mutex::new(SocketInner::new(socket_ptr, umem.clone()))),
+            _inner: Arc::new(Mutex::new(SocketInner::new_libxdp(socket_ptr, umem.clone()))),
         };
 
         let tx_q = if tx_q.is_ring_null() {
@@ -219,6 +269,215 @@ impl Socket {
 
         Ok((tx_q, rx_q, fq_and_cq))
     }
+
+    /// Reconstruct an AF_XDP socket in a successor process from an
+    /// inherited data-socket FD. Bypasses libxdp entirely: queries
+    /// `XDP_MMAP_OFFSETS` and `mmap`s the RX/TX/Fill/Completion rings
+    /// directly, then populates `XskRingProd`/`XskRingCons` from the
+    /// returned offsets.
+    ///
+    /// `umem` must be the [`Umem`] reconstructed via
+    /// [`Umem::from_memfd`] against the same memfd that the original
+    /// socket registered. `config` must reflect the RX/TX ring sizes
+    /// used at original socket creation, and `fill_queue_size` /
+    /// `comp_queue_size` must match the values on the `UmemConfig` used
+    /// when the original UMEM was registered. The kernel retains the
+    /// sizes; passing different values would produce ring wrappers that
+    /// miscount entries.
+    ///
+    /// See `crouter/docs/xdp_reexec_investigation.md` for the
+    /// lifetime and FD-inheritance model.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be an AF_XDP socket FD inherited from a process that
+    /// still held the kernel binding at the time of the exec
+    /// (typically via [`libc::execv`] without closing the FD and after
+    /// clearing `FD_CLOEXEC`). The caller must not concurrently use
+    /// `fd` in any other AF_XDP wrapper.
+    #[cfg(not(test))]
+    pub unsafe fn from_raw_fd(
+        config: SocketConfig,
+        umem: &Umem,
+        fd: OwnedFd,
+        fill_queue_size: QueueSize,
+        comp_queue_size: QueueSize,
+    ) -> Result<(TxQueue, RxQueue, Option<(FillQueue, CompQueue)>), SocketCreateError> {
+        use crate::umem::{CompQueue, FillQueue};
+
+        let offsets = getsockopt_mmap_offsets(fd.as_raw_fd()).map_err(|e| SocketCreateError {
+            reason: "getsockopt(XDP_MMAP_OFFSETS) failed on inherited FD",
+            err: e,
+        })?;
+
+        let rx_size = config.rx_queue_size().get();
+        let tx_size = config.tx_queue_size().get();
+        let fr_size = fill_queue_size.get();
+        let cr_size = comp_queue_size.get();
+
+        let xdp_desc_sz = std::mem::size_of::<libxdp_sys::xdp_desc>();
+        let u64_sz = std::mem::size_of::<u64>();
+
+        // RX: consumer ring (kernel produces, we consume).
+        let rx_len = (offsets.rx.desc + (rx_size as u64) * xdp_desc_sz as u64) as usize;
+        let rx_addr = mmap_ring(&fd, rx_len, libxdp_sys::XDP_PGOFF_RX_RING.into())?;
+        let rx = build_ring_cons(rx_addr, &offsets.rx, rx_size);
+
+        // TX: producer ring (we produce, kernel consumes).
+        let tx_len = (offsets.tx.desc + (tx_size as u64) * xdp_desc_sz as u64) as usize;
+        let tx_addr = mmap_ring(&fd, tx_len, libxdp_sys::XDP_PGOFF_TX_RING.into())?;
+        let tx = build_ring_prod(tx_addr, &offsets.tx, tx_size);
+
+        // Fill: producer ring (we produce, kernel consumes UMEM frames).
+        let fr_len = (offsets.fr.desc + (fr_size as u64) * u64_sz as u64) as usize;
+        let fr_addr = mmap_ring(&fd, fr_len, libxdp_sys::XDP_UMEM_PGOFF_FILL_RING as i64)?;
+        let fr = build_ring_prod(fr_addr, &offsets.fr, fr_size);
+
+        // Completion: consumer ring (kernel produces, we consume).
+        let cr_len = (offsets.cr.desc + (cr_size as u64) * u64_sz as u64) as usize;
+        let cr_addr = mmap_ring(&fd, cr_len, libxdp_sys::XDP_UMEM_PGOFF_COMPLETION_RING as i64)?;
+        let cr = build_ring_cons(cr_addr, &offsets.cr, cr_size);
+
+        let raw_fd = fd.as_raw_fd();
+
+        // Transfer Fill/Completion ring regions to the Umem so they
+        // outlive any FillQueue/CompQueue holding pointers into them.
+        umem.inner_attach_restored_fc(fr_addr, fr_len);
+        umem.inner_attach_restored_fc(cr_addr, cr_len);
+
+        // RX/TX live on the Socket — dropped with SocketInner when
+        // all clones of Socket are gone.
+        let socket = Socket {
+            fd: Fd::new(raw_fd),
+            _inner: Arc::new(Mutex::new(SocketInner::new_inherited(fd, umem.clone()))),
+        };
+
+        let tx_q = TxQueue::new(tx, socket.clone());
+        let rx_q = RxQueue::new(rx, socket.clone());
+
+        // Stash the RX/TX mmap regions on the Socket so they live as
+        // long as any Queue clone of this Socket.
+        socket.attach_rx_tx_mmaps(rx_addr, rx_len, tx_addr, tx_len);
+
+        let fq = FillQueue::new(fr, umem.clone());
+        let cq = CompQueue::new(cr, umem.clone());
+
+        Ok((tx_q, rx_q, Some((fq, cq))))
+    }
+
+    #[cfg(not(test))]
+    fn attach_rx_tx_mmaps(
+        &self,
+        rx_addr: *mut libc::c_void,
+        rx_len: usize,
+        tx_addr: *mut libc::c_void,
+        tx_len: usize,
+    ) {
+        let mut inner = self._inner.lock().unwrap();
+        inner.rx_tx_mmaps.push(RawMmap {
+            addr: rx_addr,
+            len: rx_len,
+        });
+        inner.rx_tx_mmaps.push(RawMmap {
+            addr: tx_addr,
+            len: tx_len,
+        });
+    }
+}
+
+// ---- Raw AF_XDP ring reconstruction helpers (Path A: no libxdp) ----
+
+#[cfg(not(test))]
+fn getsockopt_mmap_offsets(
+    fd: std::os::fd::RawFd,
+) -> io::Result<libxdp_sys::xdp_mmap_offsets> {
+    use std::mem::MaybeUninit;
+    let mut off = MaybeUninit::<libxdp_sys::xdp_mmap_offsets>::zeroed();
+    let mut len = std::mem::size_of::<libxdp_sys::xdp_mmap_offsets>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_XDP,
+            libxdp_sys::XDP_MMAP_OFFSETS as libc::c_int,
+            off.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { off.assume_init() })
+    }
+}
+
+#[cfg(not(test))]
+fn mmap_ring(
+    fd: &OwnedFd,
+    len: usize,
+    offset: i64,
+) -> Result<*mut libc::c_void, SocketCreateError> {
+    let addr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_POPULATE,
+            fd.as_raw_fd(),
+            offset as libc::off_t,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        Err(SocketCreateError {
+            reason: "mmap of inherited ring failed",
+            err: io::Error::last_os_error(),
+        })
+    } else {
+        Ok(addr)
+    }
+}
+
+#[cfg(not(test))]
+fn build_ring_prod(
+    base: *mut libc::c_void,
+    off: &libxdp_sys::xdp_ring_offset,
+    size: u32,
+) -> XskRingProd {
+    let mut r = XskRingProd::default();
+    let m = r.as_mut();
+    m.mask = size - 1;
+    m.size = size;
+    unsafe {
+        m.producer = (base as *mut u8).add(off.producer as usize) as *mut u32;
+        m.consumer = (base as *mut u8).add(off.consumer as usize) as *mut u32;
+        m.flags = (base as *mut u8).add(off.flags as usize) as *mut u32;
+        m.ring = (base as *mut u8).add(off.desc as usize) as *mut std::ffi::c_void;
+        m.cached_prod = *m.producer;
+        // For producer rings (Tx, Fill) libxdp stores cached_cons as
+        // *consumer + ring_size so nb_free math wraps correctly.
+        m.cached_cons = (*m.consumer).wrapping_add(size);
+    }
+    r
+}
+
+#[cfg(not(test))]
+fn build_ring_cons(
+    base: *mut libc::c_void,
+    off: &libxdp_sys::xdp_ring_offset,
+    size: u32,
+) -> XskRingCons {
+    let mut r = XskRingCons::default();
+    let m = r.as_mut();
+    m.mask = size - 1;
+    m.size = size;
+    unsafe {
+        m.producer = (base as *mut u8).add(off.producer as usize) as *mut u32;
+        m.consumer = (base as *mut u8).add(off.consumer as usize) as *mut u32;
+        m.flags = (base as *mut u8).add(off.flags as usize) as *mut u32;
+        m.ring = (base as *mut u8).add(off.desc as usize) as *mut std::ffi::c_void;
+        m.cached_prod = *m.producer;
+        m.cached_cons = *m.consumer;
+    }
+    r
 }
 
 impl Clone for Socket {
@@ -252,17 +511,57 @@ impl Error for SocketCreateError {
 impl Socket {
     /// Update XSKMAP with this socket using the proper libxdp function.
     /// This is the correct way to register AF_XDP sockets in XSKMAP.
-    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), Box<dyn Error>> {
-        let inner = self._inner.lock().map_err(|e| format!("Failed to lock socket: {}", e))?;
-        let xsk_ptr = inner._ptr.0.as_ptr();
-        
-        unsafe {
-            let ret = libxdp_sys::xsk_socket__update_xskmap(xsk_ptr, map_fd);
-            if ret < 0 {
-                return Err(format!("xsk_socket__update_xskmap failed: {}", ret).into());
-            }
+    pub fn update_xskmap(&self, map_fd: i32) -> Result<(), UpdateXskmapError> {
+        let inner = self
+            ._inner
+            .lock()
+            .map_err(|_| UpdateXskmapError::Poisoned)?;
+        let xsk_ptr = match &inner.owner {
+            SocketOwner::Libxdp(p) => p.0.as_ptr(),
+            SocketOwner::Inherited(_) => return Err(UpdateXskmapError::InheritedSocket),
+        };
+
+        let ret = unsafe { libxdp_sys::xsk_socket__update_xskmap(xsk_ptr, map_fd) };
+        if ret < 0 {
+            return Err(UpdateXskmapError::Libxdp(io::Error::from_raw_os_error(-ret)));
         }
-        
+
         Ok(())
+    }
+}
+
+/// Error detailing why [`Socket::update_xskmap`] failed.
+#[derive(Debug)]
+pub enum UpdateXskmapError {
+    /// The socket's inner mutex was poisoned by a panicking holder.
+    Poisoned,
+    /// The socket was reconstructed via [`Socket::from_raw_fd`] and has
+    /// no libxdp handle; the successor must update the XSKMAP using the
+    /// raw FD directly.
+    InheritedSocket,
+    /// `xsk_socket__update_xskmap` returned a negative errno.
+    Libxdp(io::Error),
+}
+
+impl fmt::Display for UpdateXskmapError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Poisoned => write!(f, "socket mutex was poisoned"),
+            Self::InheritedSocket => write!(
+                f,
+                "update_xskmap is not available on sockets reconstructed via from_raw_fd; \
+                 the successor must update the XSKMAP by raw FD instead"
+            ),
+            Self::Libxdp(_) => write!(f, "xsk_socket__update_xskmap failed"),
+        }
+    }
+}
+
+impl Error for UpdateXskmapError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Libxdp(e) => Some(e),
+            _ => None,
+        }
     }
 }

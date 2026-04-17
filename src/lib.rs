@@ -128,7 +128,7 @@ cfg_if! {
         pub use umem::{frame::FrameDesc, CompQueue, FillQueue, Umem};
 
         pub mod socket;
-        pub use socket::{RxQueue, Socket, TxQueue};
+        pub use socket::{RxQueue, Socket, TxQueue, UpdateXskmapError};
 
         pub mod config;
 

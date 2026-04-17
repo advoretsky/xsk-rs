@@ -4,6 +4,7 @@ use mmap::Mmap;
 use std::{
     io,
     num::NonZeroU32,
+    os::fd::RawFd,
     ptr::NonNull,
     slice,
     sync::{Arc, Mutex},
@@ -25,6 +26,10 @@ pub struct UmemRegion {
     // region.
     addr: NonNull<libc::c_void>,
     len: usize,
+    // memfd backing `_mmap`. Cached here so callers can borrow it
+    // without locking (the fd is stable for the life of the mmap).
+    // In `#[cfg(test)]` builds the mock Mmap has no fd; this is -1.
+    memfd: RawFd,
     _mmap: Arc<Mutex<Mmap>>,
 }
 
@@ -50,6 +55,35 @@ impl UmemRegion {
             layout: frame_layout,
             addr: mmap.addr(),
             len,
+            memfd: mmap.as_raw_fd(),
+            _mmap: Arc::new(Mutex::new(mmap)),
+        })
+    }
+
+    /// Rebuild a [`UmemRegion`] from an inherited memfd without going
+    /// through libxdp. The memfd must describe a UMEM region that was
+    /// previously registered with the kernel via an AF_XDP socket; the
+    /// same socket FD must be inherited separately so the successor
+    /// can access the kernel UMEM binding.
+    ///
+    /// See `crouter/docs/xdp_reexec_investigation.md` for the lifetime
+    /// model this assumes.
+    #[cfg(not(test))]
+    pub(crate) fn from_memfd(
+        frame_count: NonZeroU32,
+        frame_layout: FrameLayout,
+        memfd: std::os::fd::OwnedFd,
+    ) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let len = (frame_count.get() as usize) * frame_layout.frame_size();
+        let raw_fd = memfd.as_raw_fd();
+        let mmap = Mmap::from_fd(memfd, len)?;
+
+        Ok(Self {
+            layout: frame_layout,
+            addr: mmap.addr(),
+            len,
+            memfd: raw_fd,
             _mmap: Arc::new(Mutex::new(mmap)),
         })
     }
@@ -64,6 +98,13 @@ impl UmemRegion {
     #[inline]
     pub fn as_ptr(&self) -> *mut libc::c_void {
         self.addr.as_ptr()
+    }
+
+    /// Raw memfd that backs this region (for SCM_RIGHTS handoff).
+    /// Returns -1 in test builds where the mock uses heap memory.
+    #[inline]
+    pub fn memfd(&self) -> RawFd {
+        self.memfd
     }
 
     /// A pointer to the headroom segment of the frame described by
