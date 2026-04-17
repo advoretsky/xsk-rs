@@ -321,6 +321,15 @@ impl Umem {
         self.mem.len()
     }
 
+    /// Raw memfd that backs the UMEM. Pass via `SCM_RIGHTS` to share
+    /// the same physical pages with another process (re-exec handoff).
+    /// Returns -1 when the crate is compiled in test mode where the
+    /// region is a heap [`Vec`] rather than an mmap.
+    #[inline]
+    pub fn memfd(&self) -> std::os::fd::RawFd {
+        self.mem.memfd()
+    }
+
     /// Intended to be called on socket creation, this passes the
     /// create function a pointer to the UMEM and any saved fill queue
     /// or completion queue.
