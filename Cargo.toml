@@ -13,7 +13,14 @@ keywords = ["AF_XDP", "XSK", "eBPF", "XDP"]
 bitflags = "2.9.0"
 cfg-if = "1.0.0"
 libc = "0.2.171"
-libxdp-sys = "0.2.2"
+# `use_cc_build` opts into the CC-based build of libxdp-sys 0.2.4+. The
+# default Make-based build (the upstream default after libxdp-sys PR #15
+# reverted #13) doesn't honor cargo's target-arch env when cross-compiling,
+# so aarch64 builds end up with x86_64 ELF objects in the rlib and the
+# final link fails. PR #13 (which 0.2.3 carried as default) lives on as
+# this feature in 0.2.4. crouter's CI cross-compiles to aarch64; without
+# this we'd be stuck on the yanked 0.2.3.
+libxdp-sys = { version = "0.2.4", features = ["use_cc_build"] }
 log = "0.4.27"
 
 [dev-dependencies]
